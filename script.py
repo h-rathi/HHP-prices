@@ -175,6 +175,34 @@ async def human_delay_short():
     """Small helper to yield control briefly (kept minimal to respect original logic)."""
     await asyncio.sleep(0.1)
 
+async def get_page_content_safe(page, retries=4):
+    """Return page HTML, tolerating in-flight client-side navigations.
+
+    BestBuy fires a delayed client-side navigation/reload ~20s after load, which
+    made a bare `page.content()` throw:
+      "Unable to retrieve content because the page is navigating and changing".
+    We wait for the page to settle and retry; as a last resort we read
+    document.documentElement.outerHTML via JS (works mid-navigation).
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            # let any in-flight navigation finish before grabbing content
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            return await page.content()
+        except Exception as e:
+            last_err = e
+            # brief settle, then retry
+            await asyncio.sleep(2.5)
+    # final fallback: pull the DOM directly (succeeds even while navigating)
+    try:
+        return await page.evaluate("() => document.documentElement.outerHTML")
+    except Exception:
+        raise last_err
+
 def sanitize_filename(s: str, maxlen: int = 200) -> str:
     """Create a filesystem-safe short filename from a string (URL)."""
     if not s:
@@ -484,6 +512,12 @@ async def save_amazon_htmls(
         try:
             results = []
             for idx, url in enumerate(urls, start=1):
+                # empty slot (e.g. product not yet listed): keep the position so
+                # results stay aligned with the product groups, but skip cleanly.
+                if not url or not url.strip():
+                    print(f"\n[Amazon {idx}/{len(urls)}] empty URL slot -> skipping")
+                    results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
+                    continue
                 try:
                     safe_name = sanitize_filename(url)[:120]
                     output_file = os.path.join(output_dir, f"amazon_{idx}_{safe_name}.html")
@@ -509,8 +543,8 @@ async def save_amazon_htmls(
                         await page.mouse.wheel(0, scroll_y)
                         await human_delay(1, 3)
 
-                    # Extract HTML
-                    html_content = await page.content()
+                    # Extract HTML (resilient to any mid-load client-side navigation)
+                    html_content = await get_page_content_safe(page)
                     with open(output_file, "w", encoding="utf-8") as f:
                         f.write(html_content)
                     print(f"✅ HTML saved to {output_file}")
@@ -704,6 +738,12 @@ async def save_bestbuy_htmls(
         results = []
         try:
             for idx, url in enumerate(urls, start=1):
+                # empty slot (e.g. product not yet listed): keep the position so
+                # results stay aligned with the product groups, but skip cleanly.
+                if not url or not url.strip():
+                    print(f"\n[BestBuy {idx}/{len(urls)}] empty URL slot -> skipping")
+                    results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
+                    continue
                 safe_name = sanitize_filename(url)[:120]
                 output_file = os.path.join(output_dir, f"bestbuy_{idx}_{safe_name}.html")
                 page = None
@@ -722,7 +762,7 @@ async def save_bestbuy_htmls(
                             await page.wait_for_load_state("domcontentloaded", timeout=7000)
                         except TimeoutError:
                             pass
-                    
+
 
 
 
@@ -745,8 +785,9 @@ async def save_bestbuy_htmls(
                         await page.mouse.wheel(0, scroll_y)
                         await human_delay(1, 3)
 
-                    # Extract HTML
-                    html_content = await page.content()
+                    # Extract HTML (resilient to BestBuy's mid-load client-side
+                    # navigation which used to make page.content() throw)
+                    html_content = await get_page_content_safe(page)
                     with open(output_file, "w", encoding="utf-8") as f:
                         f.write(html_content)
                     print(f"✅ HTML saved to {output_file}")
@@ -874,6 +915,12 @@ async def save_samsung_htmls(
         results = []
         try:
             for idx, url in enumerate(urls, start=1):
+                # empty slot (e.g. product not yet listed): keep the position so
+                # results stay aligned with the product groups, but skip cleanly.
+                if not url or not url.strip():
+                    print(f"\n[Samsung {idx}/{len(urls)}] empty URL slot -> skipping")
+                    results.append({"url": url, "file": None, "price": None, "sku": None, "status": "empty"})
+                    continue
                 safe_name = sanitize_filename(url)
                 output_file = os.path.join(output_dir, f"samsung_{idx}_{safe_name}.html")
 
@@ -903,7 +950,7 @@ async def save_samsung_htmls(
                     except TimeoutError:
                         print("❌ #device_info did NOT load — Samsung blocked or loaded too slowly.")
                         # Still save HTML for debugging
-                        html = await page.content()
+                        html = await get_page_content_safe(page)
                         with open(output_file, "w", encoding="utf-8") as f:
                             f.write(html)
                         sku = extract_sku_from_url(url)
@@ -916,8 +963,8 @@ async def save_samsung_htmls(
                     # Extra wait for prices inside #device_info
                     await page.wait_for_selector("#device_info span", timeout=15000)
 
-                    # Save HTML
-                    html = await page.content()
+                    # Save HTML (resilient to any mid-load client-side navigation)
+                    html = await get_page_content_safe(page)
                     with open(output_file, "w", encoding="utf-8") as f:
                         f.write(html)
                     print(f"✅ HTML saved to {output_file}")
