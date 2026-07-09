@@ -47,6 +47,13 @@ from openpyxl import Workbook, load_workbook
 # =========================================================================
 NOT_AVAILABLE = "not available"
 
+# Retry policy for transient failures (network errors, timeouts, or a page that
+# navigated OK but didn't render its price in time). 1 initial try + 2 retries.
+# Genuine outcomes (a redirect to another product, or a page that explicitly says
+# it's unavailable) are treated as FINAL and are NOT retried.
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF_SEC = 5
+
 # Excel layout of Price Comparisons_v3_WIP (per product group of 9 columns):
 #   +0 Amazon price  +1 Samsung price  +2 BestBuy price
 #   +3 SKU_Amazon    +4 SKU_Samsung    +5 SKU_BestBuy
@@ -95,6 +102,29 @@ def get_canonical_href(html):
         return None
     h = re.search(r'href=["\']([^"\']+)["\']', m.group(0), re.I)
     return h.group(1) if h else None
+
+def _looks_unavailable(html, site):
+    """True when the page EXPLICITLY signals the product is unavailable/sold out.
+
+    Used by the retry loop to decide whether a "no price" outcome is FINAL (the
+    seller genuinely isn't selling it -> don't waste retries) vs TRANSIENT (the
+    price element simply didn't render this time -> retry). Verified against the
+    saved pages: Amazon's own out-of-stock listings render the exact phrase
+    "Currently unavailable"; only third-party offers carry a price, which we
+    deliberately don't scrape.
+    """
+    if not html:
+        return False
+    low = html.lower()
+    if site == "amazon":
+        return "currently unavailable" in low
+    if site == "bestbuy":
+        return "sold out" in low or "no longer available" in low
+    if site == "samsung":
+        return ("sold out" in low or "coming soon" in low
+                or "out of stock" in low or "notify me" in low)
+    return False
+
 
 def iter_ldjson(html):
     """Yield parsed JSON-LD objects from the HTML (regex-sliced, fast)."""
@@ -518,65 +548,84 @@ async def save_amazon_htmls(
                     print(f"\n[Amazon {idx}/{len(urls)}] empty URL slot -> skipping")
                     results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
                     continue
-                try:
-                    safe_name = sanitize_filename(url)[:120]
-                    output_file = os.path.join(output_dir, f"amazon_{idx}_{safe_name}.html")
-
-                    page = await context.new_page()
-                    print(f"\n[Amazon {idx}/{len(urls)}] Navigating to {url} ...")
+                # Retry transient failures (nav error / timeout / price not
+                # rendered). A redirect or a genuine "Currently unavailable" page
+                # is a FINAL answer and is NOT retried.
+                safe_name = sanitize_filename(url)[:120]
+                output_file = os.path.join(output_dir, f"amazon_{idx}_{safe_name}.html")
+                result = None
+                for attempt in range(1, MAX_ATTEMPTS + 1):
+                    page = None
                     try:
-                        # 30s hard cap so a slow page can't stall the whole run.
-                        await page.goto(url, wait_until="load", timeout=30000)
-                    except TimeoutError:
-                        print(f"⚠️ navigation timeout for {url} after 30s. Continuing anyway...")
+                        page = await context.new_page()
+                        print(f"\n[Amazon {idx}/{len(urls)}] (attempt {attempt}/{MAX_ATTEMPTS}) Navigating to {url} ...")
                         try:
-                            await page.wait_for_load_state("domcontentloaded", timeout=7000)
+                            # 30s hard cap so a slow page can't stall the whole run.
+                            await page.goto(url, wait_until="load", timeout=30000)
                         except TimeoutError:
-                            pass
-                    await asyncio.sleep(10)  # Extra wait to ensure dynamic content loads
+                            print(f"⚠️ navigation timeout for {url} after 30s. Continuing anyway...")
+                            try:
+                                await page.wait_for_load_state("domcontentloaded", timeout=7000)
+                            except TimeoutError:
+                                pass
+                        await asyncio.sleep(10)  # Extra wait to ensure dynamic content loads
 
-                    # Wait randomly for page content to settle
-                    await human_delay(3, 6)
+                        # Wait randomly for page content to settle
+                        await human_delay(3, 6)
 
-                    # 🖱️ Simulate random human-like mouse movement
-                    for _ in range(3):
-                        x = random.randint(200, 800)
-                        y = random.randint(200, 600)
-                        await page.mouse.move(x, y, steps=random.randint(5, 15))
-                        await human_delay(0.3, 1.5)
+                        # 🖱️ Simulate random human-like mouse movement
+                        for _ in range(3):
+                            x = random.randint(200, 800)
+                            y = random.randint(200, 600)
+                            await page.mouse.move(x, y, steps=random.randint(5, 15))
+                            await human_delay(0.3, 1.5)
 
-                    # 🖱️ Random scrolling
-                    for _ in range(2):
-                        scroll_y = random.randint(400, 1000)
-                        await page.mouse.wheel(0, scroll_y)
-                        await human_delay(1, 3)
+                        # 🖱️ Random scrolling
+                        for _ in range(2):
+                            scroll_y = random.randint(400, 1000)
+                            await page.mouse.wheel(0, scroll_y)
+                            await human_delay(1, 3)
 
-                    # Extract HTML (resilient to any mid-load client-side navigation)
-                    html_content = await get_page_content_safe(page)
-                    with open(output_file, "w", encoding="utf-8") as f:
-                        f.write(html_content)
-                    print(f"✅ HTML saved to {output_file}")
+                        # Extract HTML (resilient to any mid-load client-side navigation)
+                        html_content = await get_page_content_safe(page)
+                        with open(output_file, "w", encoding="utf-8") as f:
+                            f.write(html_content)
+                        print(f"✅ HTML saved to {output_file}")
 
-                    # parse and collect results (updated: redirect-aware, scoped price)
-                    price, redirected = parse_amazon_html(output_file, expected_url=url)
+                        # parse (updated: redirect-aware, scoped price)
+                        price, redirected = parse_amazon_html(output_file, expected_url=url)
 
-                    await page.close()
+                        if redirected:
+                            result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"}
+                            break  # final: different product
+                        if price:
+                            # Amazon no longer exposes the SM- model on the page; the
+                            # writer fills SKU_Amazon from the known per-slot SM code.
+                            result = {"url": url, "file": output_file, "price": price, "model": None, "status": "ok"}
+                            break  # final: got a price
+                        # No price. If the page explicitly says unavailable, that's
+                        # a genuine result -> final. Otherwise the price element just
+                        # didn't render -> transient -> retry.
+                        result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
+                        if _looks_unavailable(html_content, "amazon"):
+                            print("ℹ️ page marked 'Currently unavailable' -> final, not retrying")
+                            break
+                        print(f"⚠️ price not found & page not marked unavailable (attempt {attempt}/{MAX_ATTEMPTS})")
+                    except Exception as e:
+                        print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
+                        result = {"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"}
+                    finally:
+                        if page:
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
+                    # reached only when the attempt was transient (no break)
+                    if attempt < MAX_ATTEMPTS:
+                        print(f"🔁 retrying in {RETRY_BACKOFF_SEC}s ...")
+                        await asyncio.sleep(RETRY_BACKOFF_SEC)
 
-                    if redirected:
-                        results.append({"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"})
-                    elif not price:
-                        results.append({"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"})
-                    else:
-                        # Amazon no longer exposes the SM- model on the page; the
-                        # writer fills SKU_Amazon from the known per-slot SM code.
-                        results.append({"url": url, "file": output_file, "price": price, "model": None, "status": "ok"})
-                except Exception as e:
-                    print(f"❌ Error processing URL {url}: {e}")
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                    results.append({"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"})
+                results.append(result)
 
             # Save cookies/session state after all pages are processed
             storage_state = await context.storage_state()
@@ -721,13 +770,17 @@ async def save_bestbuy_htmls(
     os.makedirs(output_dir, exist_ok=True)
 
     async with async_playwright() as p:
-        # NOTE: do NOT pass --disable-http2 here. It was tried to fix the S26
-        # ERR_HTTP2_PROTOCOL_ERROR, but forcing HTTP/1.1 makes BestBuy's CDN
-        # return EMPTY pages for every product from datacenter IPs, so every page
-        # hung on wait_until="load" for the full 30s -> 6h run + no data.
-        # Default HTTP/2 works: S25/older load with data; S26 pages fail fast
-        # (~2s) with the protocol error, caught by the except below.
-        browser = await p.chromium.launch(headless=headless, slow_mo=100)
+        # ROOT CAUSE of the previous total BestBuy failure: BestBuy's bot
+        # protection tears down the HTTP/2 connection for HEADLESS Chromium, so
+        # every page.goto died with net::ERR_HTTP2_PROTOCOL_ERROR and nothing was
+        # saved. The fix is to run a REAL (headful) browser. On a server with no
+        # display (EC2 / GitHub Actions) we run it under Xvfb, which gives Chromium
+        # a virtual display so headless=False works headlessly in practice.
+        #   - Keep default HTTP/2 (do NOT pass --disable-http2): forcing HTTP/1.1
+        #     made BestBuy's CDN return empty 39-byte shells for every product.
+        #   - headless is forced False below regardless of the argument, because
+        #     BestBuy simply will not serve a headless browser.
+        browser = await p.chromium.launch(headless=False, slow_mo=100)
 
         # Load existing cookies/session state if available
         if os.path.exists(cookies_file):
@@ -753,95 +806,99 @@ async def save_bestbuy_htmls(
                     print(f"\n[BestBuy {idx}/{len(urls)}] empty URL slot -> skipping")
                     results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
                     continue
+                # Retry transient failures (nav error / timeout / JSON-LD not
+                # rendered). A redirect or a genuine sold-out page is final.
                 safe_name = sanitize_filename(url)[:120]
                 output_file = os.path.join(output_dir, f"bestbuy_{idx}_{safe_name}.html")
-                page = None
-                try:
-                    page = await context.new_page()
-                    print(f"\n[BestBuy {idx}/{len(urls)}] Navigating to {url} ...")
-
-
+                result = None
+                for attempt in range(1, MAX_ATTEMPTS + 1):
+                    page = None
                     try:
-                        # 30s hard cap is the safety net: over the forced HTTP/1.1,
-                        # BestBuy's full 'load' event can be slow/never fire, so
-                        # without a timeout 'load' used to hang the whole run. With
-                        # the 30s cap, a stuck page errors out after 30s and we fall
-                        # back to domcontentloaded below, then continue.
-                        await page.goto(url, wait_until="load", timeout=30000)
-                        await asyncio.sleep(10)  # extra wait to ensure stability
-                    except TimeoutError as te:
-                        print(f"⚠️ navigation timeout for {url} after 30s. Continuing anyway...")
+                        page = await context.new_page()
+                        print(f"\n[BestBuy {idx}/{len(urls)}] (attempt {attempt}/{MAX_ATTEMPTS}) Navigating to {url} ...")
+
                         try:
-                            await page.wait_for_load_state("domcontentloaded", timeout=7000)
+                            # 30s hard cap is the safety net so a stuck page can't
+                            # hang the whole run; on timeout we fall back to
+                            # domcontentloaded and continue.
+                            await page.goto(url, wait_until="load", timeout=30000)
+                            await asyncio.sleep(10)  # extra wait to ensure stability
                         except TimeoutError:
-                            pass
+                            print(f"⚠️ navigation timeout for {url} after 30s. Continuing anyway...")
+                            try:
+                                await page.wait_for_load_state("domcontentloaded", timeout=7000)
+                            except TimeoutError:
+                                pass
 
+                        # Wait randomly for page content to settle
+                        await human_delay(3, 6)
 
+                        # 🖱️ Simulate random human-like mouse movement
+                        for _ in range(3):
+                            x = random.randint(200, 800)
+                            y = random.randint(200, 600)
+                            await page.mouse.move(x, y, steps=random.randint(5, 15))
+                            await human_delay(0.3, 1.5)
 
+                        # 🖱️ Random scrolling
+                        for _ in range(2):
+                            scroll_y = random.randint(400, 1000)
+                            await page.mouse.wheel(0, scroll_y)
+                            await human_delay(1, 3)
 
+                        # The price/model come from a JSON-LD block that BestBuy
+                        # injects via client-side JS. Wait for that JSON-LD (with an
+                        # "offers" field) before capturing, so we don't save a
+                        # half-loaded page that parses to Price=None / Model=None.
+                        try:
+                            await page.wait_for_function(
+                                """() => {
+                                    const s = document.querySelectorAll('script[type="application/ld+json"]');
+                                    for (const el of s) {
+                                        if (el.textContent && el.textContent.indexOf('"offers"') !== -1) return true;
+                                    }
+                                    return false;
+                                }""",
+                                timeout=20000,
+                            )
+                        except Exception:
+                            print("⚠️ BestBuy JSON-LD offers not detected within 20s; saving page anyway")
 
+                        # Extract HTML (resilient to BestBuy's mid-load client-side
+                        # navigation which used to make page.content() throw)
+                        html_content = await get_page_content_safe(page)
+                        with open(output_file, "w", encoding="utf-8") as f:
+                            f.write(html_content)
+                        print(f"✅ HTML saved to {output_file}")
 
+                        # Parse (updated: redirect-aware, JSON-LD)
+                        price, model, redirected = parse_bestbuy_html(output_file, expected_url=url)
 
-                    # Wait randomly for page content to settle
-                    await human_delay(3, 6)
-
-                    # 🖱️ Simulate random human-like mouse movement
-                    for _ in range(3):
-                        x = random.randint(200, 800)
-                        y = random.randint(200, 600)
-                        await page.mouse.move(x, y, steps=random.randint(5, 15))
-                        await human_delay(0.3, 1.5)
-
-                    # 🖱️ Random scrolling
-                    for _ in range(2):
-                        scroll_y = random.randint(400, 1000)
-                        await page.mouse.wheel(0, scroll_y)
-                        await human_delay(1, 3)
-
-                    # The price/model come from a JSON-LD block that BestBuy injects
-                    # via client-side JS. Because 'load' can time out over HTTP/1.1,
-                    # explicitly wait for that JSON-LD (with an "offers" field) to be
-                    # present before capturing, so we don't save a half-loaded page
-                    # that parses to Price=None / Model=None.
-                    try:
-                        await page.wait_for_function(
-                            """() => {
-                                const s = document.querySelectorAll('script[type="application/ld+json"]');
-                                for (const el of s) {
-                                    if (el.textContent && el.textContent.indexOf('"offers"') !== -1) return true;
-                                }
-                                return false;
-                            }""",
-                            timeout=20000,
-                        )
-                    except Exception:
-                        print("⚠️ BestBuy JSON-LD offers not detected within 20s; saving page anyway")
-
-                    # Extract HTML (resilient to BestBuy's mid-load client-side
-                    # navigation which used to make page.content() throw)
-                    html_content = await get_page_content_safe(page)
-                    with open(output_file, "w", encoding="utf-8") as f:
-                        f.write(html_content)
-                    print(f"✅ HTML saved to {output_file}")
-
-                    # Parse and collect results (updated: redirect-aware, JSON-LD)
-                    price, model, redirected = parse_bestbuy_html(output_file, expected_url=url)
-
-                    if redirected:
-                        results.append({"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"})
-                    elif not price:
-                        results.append({"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"})
-                    else:
-                        results.append({"url": url, "file": output_file, "price": price, "model": model, "status": "ok"})
-                    await page.close()
-                except Exception as e:
-                    print(f"❌ Error processing URL {url}: {e}")
-                    try:
+                        if redirected:
+                            result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"}
+                            break  # final: different product
+                        if price:
+                            result = {"url": url, "file": output_file, "price": price, "model": model, "status": "ok"}
+                            break  # final: got a price
+                        result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
+                        if _looks_unavailable(html_content, "bestbuy"):
+                            print("ℹ️ page marked sold out / no longer available -> final, not retrying")
+                            break
+                        print(f"⚠️ price not found & page not marked unavailable (attempt {attempt}/{MAX_ATTEMPTS})")
+                    except Exception as e:
+                        print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
+                        result = {"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"}
+                    finally:
                         if page:
-                            await page.close()
-                    except Exception:
-                        pass
-                    results.append({"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"})
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
+                    if attempt < MAX_ATTEMPTS:
+                        print(f"🔁 retrying in {RETRY_BACKOFF_SEC}s ...")
+                        await asyncio.sleep(RETRY_BACKOFF_SEC)
+
+                results.append(result)
 
             # Save cookies/session state after processing all pages
             storage_state = await context.storage_state()
@@ -955,94 +1012,96 @@ async def save_samsung_htmls(
                     continue
                 safe_name = sanitize_filename(url)
                 output_file = os.path.join(output_dir, f"samsung_{idx}_{safe_name}.html")
+                sku = extract_sku_from_url(url)
 
-                context = None
-                page = None
-                try:
-                    # create a fresh context per-URL (ensures cookies/storage are isolated and destroyed on context.close())
-                    context = await browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
-                        ),
-                        viewport={"width": 1600, "height": 900},
-                    )
-
-                    page = await context.new_page()
-                    print(f"\n[Samsung {idx}/{len(urls)}] Navigating to {url} ...")
+                # Retry transient failures (nav error / timeout / #device_info not
+                # loaded / price not rendered). A redirect or a genuine sold-out /
+                # coming-soon page is final and is NOT retried.
+                result = None
+                for attempt in range(1, MAX_ATTEMPTS + 1):
+                    context = None
+                    page = None
                     try:
-                        # 30s hard cap so a slow page can't stall the whole run.
-                        await page.goto(url, wait_until="load", timeout=30000)
-                    except TimeoutError:
-                        print(f"⚠️ navigation timeout for {url} after 30s. Continuing anyway...")
+                        # fresh context per attempt (isolates cookies/storage)
+                        context = await browser.new_context(
+                            user_agent=(
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/120.0.0.0 Safari/537.36"
+                            ),
+                            viewport={"width": 1600, "height": 900},
+                        )
 
-                    print("Waiting for network to be idle...")
-                    await wait_network_idle(page, timeout=20000)
+                        page = await context.new_page()
+                        print(f"\n[Samsung {idx}/{len(urls)}] (attempt {attempt}/{MAX_ATTEMPTS}) Navigating to {url} ...")
+                        try:
+                            # 30s hard cap so a slow page can't stall the whole run.
+                            await page.goto(url, wait_until="load", timeout=30000)
+                        except TimeoutError:
+                            print(f"⚠️ navigation timeout for {url} after 30s. Continuing anyway...")
 
-                    print("Waiting for #device_info box...")
-                    try:
-                        await page.wait_for_selector("#device_info", timeout=20000)
-                    except TimeoutError:
-                        print("❌ #device_info did NOT load — Samsung blocked or loaded too slowly.")
-                        # Still save HTML for debugging
+                        print("Waiting for network to be idle...")
+                        await wait_network_idle(page, timeout=20000)
+
+                        print("Waiting for #device_info box...")
+                        device_info_ok = True
+                        try:
+                            await page.wait_for_selector("#device_info", timeout=20000)
+                            # Extra wait for prices inside #device_info
+                            await page.wait_for_selector("#device_info span", timeout=15000)
+                        except TimeoutError:
+                            print("❌ #device_info did NOT load — Samsung blocked or loaded too slowly.")
+                            device_info_ok = False
+
+                        # Save HTML (resilient to any mid-load client-side navigation)
                         html = await get_page_content_safe(page)
                         with open(output_file, "w", encoding="utf-8") as f:
                             f.write(html)
-                        sku = extract_sku_from_url(url)
-                        results.append({"url": url, "file": output_file, "price": None, "sku": sku, "status": "partial: no device_info"})
-                        await page.close()
-                        # close the context for this URL before continuing
-                        await context.close()
-                        continue
+                        print(f"✅ HTML saved to {output_file}")
 
-                    # Extra wait for prices inside #device_info
-                    await page.wait_for_selector("#device_info span", timeout=15000)
+                        if not device_info_ok:
+                            # transient (page structure never appeared) -> retry
+                            result = {"url": url, "file": output_file, "price": None, "sku": sku, "status": "partial: no device_info"}
+                            print(f"⚠️ #device_info missing (attempt {attempt}/{MAX_ATTEMPTS})")
+                        else:
+                            # Parse saved HTML (updated: redirect-aware, JSON-LD by SKU)
+                            price, redirected = extract_price(output_file, expected_url=url)
+                            if redirected:
+                                print("[REDIRECT] Samsung redirect -> not available")
+                                result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "sku": NOT_AVAILABLE, "status": "redirect"}
+                                break  # final: different product
+                            elif price:
+                                print("🔎 Final extracted values — Price:", price, "SKU:", sku)
+                                result = {"url": url, "file": output_file, "price": price, "sku": sku, "status": "ok"}
+                                break  # final: got a price
+                            else:
+                                result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "sku": NOT_AVAILABLE, "status": "no_price"}
+                                if _looks_unavailable(html, "samsung"):
+                                    print("ℹ️ page marked sold out / coming soon -> final, not retrying")
+                                    break
+                                print(f"⚠️ price not found & page not marked unavailable (attempt {attempt}/{MAX_ATTEMPTS})")
 
-                    # Save HTML (resilient to any mid-load client-side navigation)
-                    html = await get_page_content_safe(page)
-                    with open(output_file, "w", encoding="utf-8") as f:
-                        f.write(html)
-                    print(f"✅ HTML saved to {output_file}")
+                        # tiny cooperative yield
+                        await human_delay_short()
+                    except Exception as e:
+                        print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
+                        result = {"url": url, "file": None, "price": None, "sku": None, "status": f"error: {e}"}
+                    finally:
+                        try:
+                            if page:
+                                await page.close()
+                        except Exception:
+                            pass
+                        try:
+                            if context:
+                                await context.close()
+                        except Exception:
+                            pass
+                    if attempt < MAX_ATTEMPTS:
+                        print(f"🔁 retrying in {RETRY_BACKOFF_SEC}s ...")
+                        await asyncio.sleep(RETRY_BACKOFF_SEC)
 
-                    # Save cookies/session state after each page optionally (we'll write final at end too)
-                    # storage = await context.storage_state()
-                    # with open(cookies_file, "w", encoding="utf-8") as f:
-                    #     json.dump(storage, f, indent=2)
-
-                    # Parse saved HTML (updated: redirect-aware, JSON-LD by SKU)
-                    price, redirected = extract_price(output_file, expected_url=url)
-                    sku = extract_sku_from_url(url)
-
-                    if redirected:
-                        print("[REDIRECT] Samsung redirect -> not available")
-                        results.append({"url": url, "file": output_file, "price": NOT_AVAILABLE, "sku": NOT_AVAILABLE, "status": "redirect"})
-                    elif not price:
-                        results.append({"url": url, "file": output_file, "price": NOT_AVAILABLE, "sku": NOT_AVAILABLE, "status": "no_price"})
-                    else:
-                        print("🔎 Final extracted values — Price:", price, "SKU:", sku)
-                        results.append({"url": url, "file": output_file, "price": price, "sku": sku, "status": "ok"})
-
-                    # tiny cooperative yield
-                    await human_delay_short()
-
-                    await page.close()
-                    # close the context for this URL (destroys cookies/storage)
-                    await context.close()
-
-                except Exception as e:
-                    print(f"❌ Error processing URL {url}: {e}")
-                    try:
-                        if page:
-                            await page.close()
-                    except Exception:
-                        pass
-                    try:
-                        if context:
-                            await context.close()
-                    except Exception:
-                        pass
-                    results.append({"url": url, "file": None, "price": None, "sku": None, "status": f"error: {e}"})
+                results.append(result)
 
             # Write cookies/session state once more at the end
             # storage = await context.storage_state()
