@@ -52,17 +52,28 @@ jobs:
         run: |
           python -m playwright install --with-deps
 
+      - name: Install Xvfb (virtual display for headful BestBuy)
+        run: |
+          # BestBuy tears down the HTTP/2 connection for headless Chromium, so the
+          # BestBuy scraper runs headful (headless=False). On this display-less
+          # runner we give Chromium a virtual X display via Xvfb.
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
       - name: Ensure output directory exists
         run: |
           mkdir -p outputs
 
-      - name: Run scraper (headless) and capture logs
+      - name: Run scraper (headful under Xvfb) and capture logs
         id: run-scraper
         run: |
           set -o pipefail
 
-          # run script, capture stdout+stderr to run.log while still printing to job log
-          python script.py 2>&1 | tee run.log
+          # xvfb-run provides a virtual display so the headful BestBuy browser
+          # works on this headless runner. Amazon/Samsung still launch headless
+          # from inside the script; running them under Xvfb too is harmless.
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            python script.py 2>&1 | tee run.log
           rc=${PIPESTATUS[0]}
           echo "$rc" > run_exit_code.txt
 
