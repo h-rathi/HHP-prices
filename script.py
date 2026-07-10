@@ -817,17 +817,17 @@ async def save_bestbuy_htmls(
                         print(f"\n[BestBuy {idx}/{len(urls)}] (attempt {attempt}/{MAX_ATTEMPTS}) Navigating to {url} ...")
 
                         try:
-                            # 30s hard cap is the safety net so a stuck page can't
-                            # hang the whole run; on timeout we fall back to
-                            # domcontentloaded and continue.
-                            await page.goto(url, wait_until="load", timeout=30000)
+                            # Use wait_until="domcontentloaded" (NOT "load"): BestBuy
+                            # streams many subresources over the HTTP/2 connection, and
+                            # waiting for the full 'load' event kept surfacing
+                            # net::ERR_HTTP2_PROTOCOL_ERROR when one of those streams
+                            # reset mid-wait. Returning at DOMContentLoaded (like the
+                            # known-good minimal script) avoids that; the JS-injected
+                            # price then populates during the wait below. 60s cap.
+                            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                             await asyncio.sleep(10)  # extra wait to ensure stability
                         except TimeoutError:
-                            print(f"⚠️ navigation timeout for {url} after 30s. Continuing anyway...")
-                            try:
-                                await page.wait_for_load_state("domcontentloaded", timeout=7000)
-                            except TimeoutError:
-                                pass
+                            print(f"⚠️ navigation timeout for {url} after 60s. Continuing anyway...")
 
                         # Wait randomly for page content to settle
                         await human_delay(3, 6)
