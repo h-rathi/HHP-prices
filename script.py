@@ -38,9 +38,11 @@ from openpyxl import Workbook, load_workbook
 #    scope price extraction to the MAIN price container only.
 # 3. Updated selectors for current UI: Amazon price -> corePriceDisplay /
 #    priceToPay; BestBuy & Samsung price -> JSON-LD offer (Samsung keyed by SKU).
-# 4. BestBuy S26 fix: those pages fail Playwright's HTTP/2 with
-#    ERR_HTTP2_PROTOCOL_ERROR, so nothing saved. We launch BestBuy's Chromium
-#    with --disable-http2 (forces HTTP/1.1) so S26 pages load.
+# 4. BestBuy fix: headless Chromium fails with ERR_HTTP2_PROTOCOL_ERROR (BestBuy
+#    tears down the HTTP/2 connection for headless browsers), so nothing is saved.
+#    We launch BestBuy's Chromium HEADFUL (headless=False) on default HTTP/2 (NOT
+#    --disable-http2, which made the CDN return empty shells) and with no custom
+#    user-agent. On a display-less server (EC2 / GitHub Actions) run it under Xvfb.
 # 5. results.xlsx now uses the same layout as "Price Comparisons_v3_WIP":
 #    51 product groups x 9 columns starting at column C, timestamp in column B.
 # Everything else (URLs, delays, user agents, cookies logic) is unchanged.
@@ -782,20 +784,17 @@ async def save_bestbuy_htmls(
         #     BestBuy simply will not serve a headless browser.
         browser = await p.chromium.launch(headless=False, slow_mo=100)
 
-        # Load existing cookies/session state if available
+        # IMPORTANT (BestBuy only): do NOT set a custom user_agent. A spoofed
+        # "Windows ... Chrome/120" UA on a real Linux Chromium is a fingerprint
+        # mismatch that can make BestBuy tear down the HTTP/2 connection
+        # (net::ERR_HTTP2_PROTOCOL_ERROR). We let the context use the UA that
+        # matches the actual headful browser. Cookie/session persistence is kept.
         if os.path.exists(cookies_file):
             print("🍪 Loading existing cookies/session...")
             context = await browser.new_context(storage_state=cookies_file)
         else:
             print("🆕 No cookies found, creating a new session...")
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 768},
-            )
+            context = await browser.new_context()
 
         results = []
         try:
