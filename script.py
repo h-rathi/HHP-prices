@@ -21,6 +21,31 @@ import re
 from urllib.parse import quote_plus
 from playwright.async_api import async_playwright, TimeoutError
 from bs4 import BeautifulSoup
+
+# Optional anti-bot stealth (used for BestBuy only). The package API differs
+# across versions, so we detect what's available and expose a single async
+# helper _apply_stealth(page). If the package isn't installed, it's a no-op so
+# the rest of the script still runs.
+#   - playwright-stealth 1.x:  from playwright_stealth import stealth_async
+#   - playwright-stealth 2.x:  from playwright_stealth import Stealth  (Stealth().apply_stealth_async)
+try:
+    from playwright_stealth import stealth_async as _stealth_async  # 1.x
+
+    async def _apply_stealth(page):
+        await _stealth_async(page)
+    _STEALTH_AVAILABLE = True
+except Exception:
+    try:
+        from playwright_stealth import Stealth as _Stealth  # 2.x
+        _stealth_instance = _Stealth()
+
+        async def _apply_stealth(page):
+            await _stealth_instance.apply_stealth_async(page)
+        _STEALTH_AVAILABLE = True
+    except Exception:
+        async def _apply_stealth(page):
+            return None  # package not installed -> no-op
+        _STEALTH_AVAILABLE = False
 from openpyxl.utils import column_index_from_string, get_column_letter
 # new imports for Excel writing
 from openpyxl import Workbook, load_workbook
@@ -772,141 +797,179 @@ async def save_bestbuy_htmls(
     os.makedirs(output_dir, exist_ok=True)
 
     async with async_playwright() as p:
-        # ROOT CAUSE of the previous total BestBuy failure: BestBuy's bot
-        # protection tears down the HTTP/2 connection for HEADLESS Chromium, so
-        # every page.goto died with net::ERR_HTTP2_PROTOCOL_ERROR and nothing was
-        # saved. The fix is to run a REAL (headful) browser. On a server with no
-        # display (EC2 / GitHub Actions) we run it under Xvfb, which gives Chromium
-        # a virtual display so headless=False works headlessly in practice.
-        #   - Keep default HTTP/2 (do NOT pass --disable-http2): forcing HTTP/1.1
-        #     made BestBuy's CDN return empty 39-byte shells for every product.
-        #   - headless is forced False below regardless of the argument, because
-        #     BestBuy simply will not serve a headless browser.
-        browser = await p.chromium.launch(headless=False, slow_mo=100)
-
-        # IMPORTANT (BestBuy only): do NOT set a custom user_agent. A spoofed
-        # "Windows ... Chrome/120" UA on a real Linux Chromium is a fingerprint
-        # mismatch that can make BestBuy tear down the HTTP/2 connection
-        # (net::ERR_HTTP2_PROTOCOL_ERROR). We let the context use the UA that
-        # matches the actual headful browser. Cookie/session persistence is kept.
-        if os.path.exists(cookies_file):
-            print("🍪 Loading existing cookies/session...")
-            context = await browser.new_context(storage_state=cookies_file)
-        else:
-            print("🆕 No cookies found, creating a new session...")
-            context = await browser.new_context()
+        # ROOT CAUSE of the "only the first URL works" failure: a single browser
+        # (and single context) was reused for every URL. Chromium keeps the HTTP/2
+        # connection to bestbuy.com ALIVE and reuses it across pages. BestBuy's bot
+        # protection flags that connection after the first request and then RESETS
+        # every subsequent stream on it -> net::ERR_HTTP2_PROTOCOL_ERROR on URL 2+.
+        # A new page on the same context reuses the same poisoned connection, so it
+        # never recovers.
+        #
+        # FIX: launch a COMPLETELY FRESH browser per attempt (guarantees a brand-new
+        # HTTP/2 connection every time), persisting cookies to disk between browsers
+        # so the session still carries over. This is the strongest form of the
+        # "fresh context per URL" trick the reference scraper uses.
+        #
+        # Other BestBuy specifics (unchanged):
+        #   - Headful (headless=False): BestBuy won't serve a headless browser. On a
+        #     display-less server (EC2 / GitHub Actions) run under Xvfb.
+        #   - Default HTTP/2 (no --disable-http2, which returned empty shells).
+        #   - No custom user_agent (a spoofed UA on real Linux Chromium is a tell).
+        #   - Block image/media/font requests: fewer HTTP/2 streams to reset.
+        #   - Server-hardening args stabilise Chromium in containers.
+        launch_kwargs = dict(
+            headless=False,
+            slow_mo=100,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
 
         results = []
-        try:
-            for idx, url in enumerate(urls, start=1):
-                # empty slot (e.g. product not yet listed): keep the position so
-                # results stay aligned with the product groups, but skip cleanly.
-                if not url or not url.strip():
-                    print(f"\n[BestBuy {idx}/{len(urls)}] empty URL slot -> skipping")
-                    results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
-                    continue
-                # Retry transient failures (nav error / timeout / JSON-LD not
-                # rendered). A redirect or a genuine sold-out page is final.
-                safe_name = sanitize_filename(url)[:120]
-                output_file = os.path.join(output_dir, f"bestbuy_{idx}_{safe_name}.html")
-                result = None
-                for attempt in range(1, MAX_ATTEMPTS + 1):
-                    page = None
+        for idx, url in enumerate(urls, start=1):
+            # empty slot (e.g. product not yet listed): keep the position so
+            # results stay aligned with the product groups, but skip cleanly.
+            if not url or not url.strip():
+                print(f"\n[BestBuy {idx}/{len(urls)}] empty URL slot -> skipping")
+                results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
+                continue
+            # Retry transient failures (nav error / timeout / JSON-LD not
+            # rendered). A redirect or a genuine sold-out page is final.
+            safe_name = sanitize_filename(url)[:120]
+            output_file = os.path.join(output_dir, f"bestbuy_{idx}_{safe_name}.html")
+            result = None
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                browser = None
+                context = None
+                page = None
+                try:
+                    # FRESH browser -> fresh HTTP/2 connection for this URL/attempt
+                    browser = await p.chromium.launch(**launch_kwargs)
+
+                    # COOKIELESS, always. This is the actual fix for "only URL 1
+                    # works": BestBuy plants a bot-detection/session token in its
+                    # response cookies on the first visit. Saving those and replaying
+                    # them on the next request (storage_state=cookies_file) made
+                    # BestBuy flag the session instantly and RESET the HTTP/2
+                    # connection -> net::ERR_HTTP2_PROTOCOL_ERROR on URL 2+. The
+                    # known-good reference scraper never loads OR saves cookies for
+                    # exactly this reason, so we give every page a pristine session.
+                    context = await browser.new_context(ignore_https_errors=True)
+
+                    page = await context.new_page()
+
+                    # Apply anti-bot stealth patches (BestBuy only). Masks the
+                    # automation fingerprints (navigator.webdriver, headless
+                    # hints, etc.) that BestBuy's protection checks. No-op if the
+                    # playwright-stealth package isn't installed. Must run before
+                    # navigation so the patches are in place when page scripts run.
                     try:
-                        page = await context.new_page()
-                        print(f"\n[BestBuy {idx}/{len(urls)}] (attempt {attempt}/{MAX_ATTEMPTS}) Navigating to {url} ...")
+                        await _apply_stealth(page)
+                    except Exception as _se:
+                        print(f"⚠️ stealth patch failed (continuing without it): {_se}")
 
-                        try:
-                            # Use wait_until="domcontentloaded" (NOT "load"): BestBuy
-                            # streams many subresources over the HTTP/2 connection, and
-                            # waiting for the full 'load' event kept surfacing
-                            # net::ERR_HTTP2_PROTOCOL_ERROR when one of those streams
-                            # reset mid-wait. Returning at DOMContentLoaded (like the
-                            # known-good minimal script) avoids that; the JS-injected
-                            # price then populates during the wait below. 60s cap.
-                            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                            await asyncio.sleep(10)  # extra wait to ensure stability
-                        except TimeoutError:
-                            print(f"⚠️ navigation timeout for {url} after 60s. Continuing anyway...")
+                    # Abort image/media/font requests. Each is an HTTP/2 stream on
+                    # the connection; blocking them leaves only the document +
+                    # JSON/JS we actually parse (lighter, faster, fewer resets).
+                    async def _block_heavy(route, request):
+                        if request.resource_type in ("image", "media", "font"):
+                            await route.abort()
+                        else:
+                            await route.continue_()
+                    await page.route("**/*", _block_heavy)
 
-                        # Wait randomly for page content to settle
-                        await human_delay(3, 6)
+                    print(f"\n[BestBuy {idx}/{len(urls)}] (attempt {attempt}/{MAX_ATTEMPTS}) Navigating to {url} ...")
 
-                        # 🖱️ Simulate random human-like mouse movement
-                        for _ in range(3):
-                            x = random.randint(200, 800)
-                            y = random.randint(200, 600)
-                            await page.mouse.move(x, y, steps=random.randint(5, 15))
-                            await human_delay(0.3, 1.5)
+                    try:
+                        # wait_until="domcontentloaded" (NOT "load"): returning at
+                        # DOMContentLoaded avoids waiting on the flaky subresource
+                        # streams; the JS-injected price populates during the wait
+                        # below. Generous 180s cap matches the reference.
+                        await page.goto(url, wait_until="domcontentloaded", timeout=180000)
+                        await asyncio.sleep(10)  # extra wait to ensure stability
+                    except TimeoutError:
+                        print(f"⚠️ navigation timeout for {url} after 180s. Continuing anyway...")
 
-                        # 🖱️ Random scrolling
-                        for _ in range(2):
-                            scroll_y = random.randint(400, 1000)
-                            await page.mouse.wheel(0, scroll_y)
-                            await human_delay(1, 3)
+                    # Wait randomly for page content to settle
+                    await human_delay(3, 6)
 
-                        # The price/model come from a JSON-LD block that BestBuy
-                        # injects via client-side JS. Wait for that JSON-LD (with an
-                        # "offers" field) before capturing, so we don't save a
-                        # half-loaded page that parses to Price=None / Model=None.
-                        try:
-                            await page.wait_for_function(
-                                """() => {
-                                    const s = document.querySelectorAll('script[type="application/ld+json"]');
-                                    for (const el of s) {
-                                        if (el.textContent && el.textContent.indexOf('"offers"') !== -1) return true;
-                                    }
-                                    return false;
-                                }""",
-                                timeout=20000,
-                            )
-                        except Exception:
-                            print("⚠️ BestBuy JSON-LD offers not detected within 20s; saving page anyway")
+                    # 🖱️ Simulate random human-like mouse movement
+                    for _ in range(3):
+                        x = random.randint(200, 800)
+                        y = random.randint(200, 600)
+                        await page.mouse.move(x, y, steps=random.randint(5, 15))
+                        await human_delay(0.3, 1.5)
 
-                        # Extract HTML (resilient to BestBuy's mid-load client-side
-                        # navigation which used to make page.content() throw)
-                        html_content = await get_page_content_safe(page)
-                        with open(output_file, "w", encoding="utf-8") as f:
-                            f.write(html_content)
-                        print(f"✅ HTML saved to {output_file}")
+                    # 🖱️ Random scrolling
+                    for _ in range(2):
+                        scroll_y = random.randint(400, 1000)
+                        await page.mouse.wheel(0, scroll_y)
+                        await human_delay(1, 3)
 
-                        # Parse (updated: redirect-aware, JSON-LD)
-                        price, model, redirected = parse_bestbuy_html(output_file, expected_url=url)
+                    # The price/model come from a JSON-LD block that BestBuy
+                    # injects via client-side JS. Wait for that JSON-LD (with an
+                    # "offers" field) before capturing, so we don't save a
+                    # half-loaded page that parses to Price=None / Model=None.
+                    try:
+                        await page.wait_for_function(
+                            """() => {
+                                const s = document.querySelectorAll('script[type="application/ld+json"]');
+                                for (const el of s) {
+                                    if (el.textContent && el.textContent.indexOf('"offers"') !== -1) return true;
+                                }
+                                return false;
+                            }""",
+                            timeout=20000,
+                        )
+                    except Exception:
+                        print("⚠️ BestBuy JSON-LD offers not detected within 20s; saving page anyway")
 
-                        if redirected:
-                            result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"}
-                            break  # final: different product
-                        if price:
-                            result = {"url": url, "file": output_file, "price": price, "model": model, "status": "ok"}
-                            break  # final: got a price
-                        result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
-                        if _looks_unavailable(html_content, "bestbuy"):
-                            print("ℹ️ page marked sold out / no longer available -> final, not retrying")
-                            break
-                        print(f"⚠️ price not found & page not marked unavailable (attempt {attempt}/{MAX_ATTEMPTS})")
-                    except Exception as e:
-                        print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
-                        result = {"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"}
-                    finally:
-                        if page:
+                    # Extract HTML (resilient to BestBuy's mid-load client-side
+                    # navigation which used to make page.content() throw)
+                    html_content = await get_page_content_safe(page)
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(html_content)
+                    print(f"✅ HTML saved to {output_file}")
+
+                    # NOTE: intentionally do NOT save cookies for BestBuy. Persisting
+                    # BestBuy's session token and replaying it is what poisoned URL 2+
+                    # (see the cookieless context comment above). Every page stays
+                    # pristine, matching the known-good reference scraper.
+
+                    # Parse (updated: redirect-aware, JSON-LD)
+                    price, model, redirected = parse_bestbuy_html(output_file, expected_url=url)
+
+                    if redirected:
+                        result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"}
+                        break  # final: different product
+                    if price:
+                        result = {"url": url, "file": output_file, "price": price, "model": model, "status": "ok"}
+                        break  # final: got a price
+                    result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
+                    if _looks_unavailable(html_content, "bestbuy"):
+                        print("ℹ️ page marked sold out / no longer available -> final, not retrying")
+                        break
+                    print(f"⚠️ price not found & page not marked unavailable (attempt {attempt}/{MAX_ATTEMPTS})")
+                except Exception as e:
+                    print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
+                    result = {"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"}
+                finally:
+                    # Close EVERYTHING so the next attempt/URL starts on a brand-new
+                    # browser + connection (the whole point of this restructure).
+                    for closable in (page, context, browser):
+                        if closable:
                             try:
-                                await page.close()
+                                await closable.close()
                             except Exception:
                                 pass
-                    if attempt < MAX_ATTEMPTS:
-                        print(f"🔁 retrying in {RETRY_BACKOFF_SEC}s ...")
-                        await asyncio.sleep(RETRY_BACKOFF_SEC)
+                if attempt < MAX_ATTEMPTS:
+                    print(f"🔁 retrying in {RETRY_BACKOFF_SEC}s ...")
+                    await asyncio.sleep(RETRY_BACKOFF_SEC)
 
-                results.append(result)
-
-            # Save cookies/session state after processing all pages
-            storage_state = await context.storage_state()
-            with open(cookies_file, "w", encoding="utf-8") as f:
-                json.dump(storage_state, f, ensure_ascii=False, indent=4)
-            print(f"\n🍪 Cookies/session state written to {cookies_file}")
-
-        finally:
-            await browser.close()
+            results.append(result)
 
     return results
 
