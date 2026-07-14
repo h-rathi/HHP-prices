@@ -3,7 +3,7 @@
 # send_mail.py
 #
 # Builds a professional HTML price-comparison report from outputs/results.xlsx
-# and emails it (inline + as an .html attachment) through Microsoft's SMTP.
+# and emails it (inline HTML) through Microsoft's SMTP.
 #
 # Layout mirrors script_3.py's results.xlsx (see PRODUCT groups below) and the
 # formatting reference in image.png:
@@ -306,7 +306,6 @@ def build_email_html(groups, rows, cutoff):
     <p style="font-size:15px;margin:0 0 6px 0;">Hello,</p>
     <p style="font-size:15px;margin:0 0 16px 0;">
       Please find below the latest Samsung vs Amazon price comparison report.
-      The full report is also attached as an HTML file for your records.
     </p>
     <p style="font-size:12px;color:#666;margin:0 0 18px 0;">{note}</p>
     <div style="overflow-x:auto;">
@@ -323,7 +322,7 @@ def build_email_html(groups, rows, cutoff):
 # ---------------------------------------------------------------------------
 # email sending
 # ---------------------------------------------------------------------------
-def send_email(html_body, attachment_html):
+def send_email(html_body):
     username = os.environ.get("MAIL_USERNAME")
     password = os.environ.get("MAIL_PASSWORD")
     recipients_raw = os.environ.get("MAIL_TO", "")
@@ -350,18 +349,11 @@ def send_email(html_body, attachment_html):
     msg["Message-ID"] = make_msgid()
 
     msg.set_content(
-        "Hello,\n\nPlease find attached the Samsung vs Amazon price comparison "
+        "Hello,\n\nPlease find below the Samsung vs Amazon price comparison "
         "report. This message is best viewed in an HTML-capable email client.\n\n"
         "Best regards,\nPrice Tracking Automation"
     )
     msg.add_alternative(html_body, subtype="html")
-
-    msg.add_attachment(
-        attachment_html.encode("utf-8"),
-        maintype="text",
-        subtype="html",
-        filename=f"price_report_{datetime.now():%Y-%m-%d}.html",
-    )
 
     context = ssl.create_default_context()
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
@@ -379,7 +371,7 @@ def main():
     print(f"Loaded {len(groups)} product group(s); "
           f"{len(rows)} row(s) within the past {WINDOW_DAYS} days.")
     email_html = build_email_html(groups, rows, cutoff)
-    send_email(email_html, email_html)
+    send_email(email_html)
 
 
 if __name__ == "__main__":
