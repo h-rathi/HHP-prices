@@ -17,6 +17,11 @@ import json
 import os
 import random
 import re
+import socket
+import shutil
+import tempfile
+import subprocess
+import urllib.request
 
 from urllib.parse import quote_plus
 from playwright.async_api import async_playwright, TimeoutError
@@ -822,6 +827,127 @@ def parse_bestbuy_html(input_file="bestbuy.html", expected_url=None):
 
     return price, model_number, False
 
+def _find_free_port():
+    """Return an OS-assigned free TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _find_real_chrome():
+    """Locate the REAL Google Chrome binary (NOT Playwright's bundled Chromium).
+
+    BestBuy's bot protection is confirmed to pass with real Chrome; bundled
+    Chromium differs in fingerprint (UA-brand "Chromium", no Widevine/H.264,
+    different userAgentData) and may be flagged. So for BestBuy we insist on
+    real Chrome.
+
+    Resolution order:
+      1. $CHROME_BIN / $CHROME_PATH env var (set this on EC2 if Chrome is in a
+         non-standard location).
+      2. `chrome`/`google-chrome`/`google-chrome-stable` on PATH (Linux; the
+         GitHub Actions ubuntu runner ships google-chrome-stable).
+      3. Standard Windows install locations (for local Windows 11 runs).
+    Returns the path, or None if not found.
+    """
+    env = os.environ.get("CHROME_BIN") or os.environ.get("CHROME_PATH")
+    if env and os.path.exists(env):
+        return env
+
+    for name in ("google-chrome-stable", "google-chrome", "chrome",
+                 "chromium-browser", "chromium"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    for candidate in (
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/opt/google/chrome/chrome",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ):
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    return None
+
+
+async def _launch_chrome_cdp(playwright, extra_args=None):
+    """Launch a REAL Chrome/Chromium process with a remote-debugging port and
+    connect Playwright to it over CDP.
+
+    Why CDP instead of playwright.chromium.launch() for BestBuy: launch() starts
+    Chromium with Playwright's automation switches (e.g. --enable-automation,
+    AutomationControlled), which BestBuy's bot protection fingerprints. By
+    starting Chrome ourselves with only the flags we choose and attaching over
+    the DevTools Protocol, the browser looks like an ordinary Chrome instance.
+
+    Each call launches a fresh process with a fresh throwaway --user-data-dir, so
+    every attempt gets a brand-new HTTP/2 connection AND a pristine, cookieless
+    profile (the two things that previously broke URL 2+).
+
+    Returns (browser, proc, profile_dir). Caller must close browser, kill proc,
+    and remove profile_dir.
+    """
+    port = _find_free_port()
+    profile_dir = tempfile.mkdtemp(prefix="bb_cdp_profile_")
+    # Use the REAL Google Chrome binary (confirmed to pass BestBuy). Do NOT fall
+    # back to bundled Chromium — its fingerprint differs and may be flagged.
+    chrome_path = _find_real_chrome()
+    if not chrome_path:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        raise RuntimeError(
+            "Real Google Chrome not found. Install it (Actions ubuntu runner "
+            "ships google-chrome-stable; on EC2 install google-chrome-stable) "
+            "or set the CHROME_BIN env var to its path.")
+
+    args = [
+        chrome_path,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "about:blank",
+    ]
+    if extra_args:
+        args.extend(extra_args)
+
+    # Headful: BestBuy won't serve a headless browser. On a display-less server
+    # (EC2 / GitHub Actions) this runs under Xvfb, which supplies $DISPLAY.
+    proc = subprocess.Popen(
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Wait for the CDP endpoint to come up, then read the WebSocket URL.
+    cdp_http = f"http://127.0.0.1:{port}"
+    ws_url = None
+    for _ in range(60):  # up to ~30s
+        try:
+            with urllib.request.urlopen(f"{cdp_http}/json/version", timeout=1) as r:
+                ws_url = json.loads(r.read().decode()).get("webSocketDebuggerUrl")
+            if ws_url:
+                break
+        except Exception:
+            await asyncio.sleep(0.5)
+    if not ws_url:
+        # cleanup before raising
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        raise RuntimeError("Chrome CDP endpoint did not come up in time")
+
+    browser = await playwright.chromium.connect_over_cdp(ws_url)
+    return browser, proc, profile_dir
+
+
 async def save_bestbuy_htmls(
     urls,
     output_dir="outputs",
@@ -848,23 +974,18 @@ async def save_bestbuy_htmls(
         # so the session still carries over. This is the strongest form of the
         # "fresh context per URL" trick the reference scraper uses.
         #
+        # Browser is launched per-attempt via CDP (see _launch_chrome_cdp): we
+        # start a REAL Chrome process ourselves and attach over the DevTools
+        # Protocol, instead of p.chromium.launch() which stamps automation flags
+        # BestBuy fingerprints. Each attempt = fresh process + fresh throwaway
+        # profile = fresh HTTP/2 connection + pristine cookieless session.
+        #
         # Other BestBuy specifics (unchanged):
-        #   - Headful (headless=False): BestBuy won't serve a headless browser. On a
-        #     display-less server (EC2 / GitHub Actions) run under Xvfb.
+        #   - Headful: BestBuy won't serve a headless browser. On a display-less
+        #     server (EC2 / GitHub Actions) run under Xvfb.
         #   - Default HTTP/2 (no --disable-http2, which returned empty shells).
         #   - No custom user_agent (a spoofed UA on real Linux Chromium is a tell).
         #   - Block image/media/font requests: fewer HTTP/2 streams to reset.
-        #   - Server-hardening args stabilise Chromium in containers.
-        launch_kwargs = dict(
-            headless=False,
-            slow_mo=100,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
 
         results = []
         for idx, url in enumerate(urls, start=1):
@@ -881,21 +1002,24 @@ async def save_bestbuy_htmls(
             result = None
             for attempt in range(1, MAX_ATTEMPTS + 1):
                 browser = None
+                proc = None
+                profile_dir = None
                 context = None
                 page = None
                 try:
-                    # FRESH browser -> fresh HTTP/2 connection for this URL/attempt
-                    browser = await p.chromium.launch(**launch_kwargs)
+                    # FRESH Chrome via CDP -> fresh HTTP/2 connection + a pristine,
+                    # throwaway profile for this URL/attempt. COOKIELESS by design:
+                    # BestBuy plants a bot-detection/session token in its response
+                    # cookies on the first visit; replaying it poisoned URL 2+
+                    # (net::ERR_HTTP2_PROTOCOL_ERROR). A brand-new --user-data-dir
+                    # each time guarantees no cookie/session carries over.
+                    browser, proc, profile_dir = await _launch_chrome_cdp(p)
 
-                    # COOKIELESS, always. This is the actual fix for "only URL 1
-                    # works": BestBuy plants a bot-detection/session token in its
-                    # response cookies on the first visit. Saving those and replaying
-                    # them on the next request (storage_state=cookies_file) made
-                    # BestBuy flag the session instantly and RESET the HTTP/2
-                    # connection -> net::ERR_HTTP2_PROTOCOL_ERROR on URL 2+. The
-                    # known-good reference scraper never loads OR saves cookies for
-                    # exactly this reason, so we give every page a pristine session.
-                    context = await browser.new_context(ignore_https_errors=True)
+                    # Over CDP the fresh Chrome already exposes a default context
+                    # (browser.contexts[0]); since the profile is brand-new it is
+                    # pristine and cookieless, so we use it directly.
+                    context = (browser.contexts[0] if browser.contexts
+                               else await browser.new_context())
 
                     page = await context.new_page()
 
@@ -995,14 +1119,25 @@ async def save_bestbuy_htmls(
                     print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
                     result = {"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"}
                 finally:
-                    # Close EVERYTHING so the next attempt/URL starts on a brand-new
-                    # browser + connection (the whole point of this restructure).
+                    # Tear down EVERYTHING so the next attempt/URL starts on a
+                    # brand-new Chrome process + connection + profile.
                     for closable in (page, context, browser):
                         if closable:
                             try:
                                 await closable.close()
                             except Exception:
                                 pass
+                    # browser.close() only DISCONNECTS the CDP session; the real
+                    # Chrome process we spawned must be killed explicitly, and its
+                    # throwaway profile dir removed, or they'd leak every attempt.
+                    if proc:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=10)
+                        except Exception:
+                            pass
+                    if profile_dir:
+                        shutil.rmtree(profile_dir, ignore_errors=True)
                 if attempt < MAX_ATTEMPTS:
                     print(f"🔁 retrying in {RETRY_BACKOFF_SEC}s ...")
                     await asyncio.sleep(RETRY_BACKOFF_SEC)
