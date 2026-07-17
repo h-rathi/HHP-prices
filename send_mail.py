@@ -47,7 +47,7 @@ SUBHEADER_ROW   = 2          # sub-headers
 FIRST_DATA_ROW  = 3
 TS_FORMAT       = "%d %b %Y, %H:%M"   # e.g. "05 Jul 2026, 08:02"
 NOT_AVAILABLE   = "not available"
-WINDOW_DAYS     = 15
+WINDOW_DAYS     = 4
 
 # per-group column offsets (0-indexed from the group's first column)
 OFF_AMAZON_PRICE  = 0
@@ -107,11 +107,11 @@ def _fmt_vs(amazon_val, samsung_val):
         return "&mdash;", "#9e9e9e"
     pct = (a / s - 1.0) * 100.0
     if round(pct, 1) == 0:        # rounds to zero -> show a clean "0%"
-        return "0%", "#e0e0e0"
+        return "0%", "#000000"
     if pct > 0:
-        colour = "#4caf50"        # Amazon pricier than Samsung
+        colour = "#1b7a2f"        # Amazon pricier than Samsung (green)
     else:
-        colour = "#ff6b6b"        # Amazon cheaper than Samsung
+        colour = "#c62828"        # Amazon cheaper than Samsung (red)
     return f"{-pct:+.1f}%", colour
 
 
@@ -164,8 +164,11 @@ def load_report_model(path=EXCEL_PATH):
     # show products in reverse order (last product first)
     groups.reverse()
 
-    # cutoff: keep rows whose timestamp is within the past WINDOW_DAYS
-    cutoff = datetime.now() - timedelta(days=WINDOW_DAYS)
+    # cutoff: keep rows from the past WINDOW_DAYS calendar days. Floor to the
+    # start of the day so ALL of the earliest day's runs are kept -- otherwise
+    # now()'s time-of-day would drop that day's runs recorded before it.
+    cutoff = (datetime.now() - timedelta(days=WINDOW_DAYS)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
 
     rows = []
     for r in range(FIRST_DATA_ROW, max_row + 1):
@@ -199,15 +202,15 @@ def load_report_model(path=EXCEL_PATH):
 # ---------------------------------------------------------------------------
 # HTML rendering (inline styles only -- email clients strip <style> blocks)
 # ---------------------------------------------------------------------------
-# palette modelled on image.png (dark theme, blue accent on the "vs" column)
-BG          = "#1e1e1e"
-GRID        = "#000000"
-TITLE_BG    = "#2b2b2b"
-SUBHEAD_BG  = "#333333"
-CELL_BG     = "#262626"
-CELL_BG_ALT = "#2d2d2d"
-TEXT        = "#f5f5f5"
-ACCENT      = "#5b9bd5"     # "vs Amazon" header colour
+# palette: solid light-gray fill (#D9D9D9 == Excel Theme 0, tint -15%), black text
+BG          = "#d9d9d9"
+GRID        = "#bfbfbf"
+TITLE_BG    = "#c9c9c9"     # slightly darker so header rows read as headers
+SUBHEAD_BG  = "#c9c9c9"
+CELL_BG     = "#d9d9d9"
+CELL_BG_ALT = "#e9e9e9"     # subtle zebra striping
+TEXT        = "#000000"
+SEP         = "#808080"     # divider between date groups
 
 TD_BASE = (f"border:1px solid {GRID};padding:8px 12px;"
            f"font-family:Segoe UI,Arial,sans-serif;font-size:13px;"
@@ -245,13 +248,26 @@ def build_table_html(groups, rows):
         parts.append(_th("SKU", bg=SUBHEAD_BG))
         parts.append(_th("Samsung Price", bg=SUBHEAD_BG))
         parts.append(_th("Amazon Price", bg=SUBHEAD_BG))
-        parts.append(_th("vs Amazon", bg=SUBHEAD_BG, colour=ACCENT))
+        parts.append(_th("vs Amazon", bg=SUBHEAD_BG))
         parts.append("</tr>")
 
-        # ---- data rows (one per timestamp) ----------------------------------
+        # ---- data rows (one per timestamp), grouped by date -----------------
+        prev_date = None
         for ridx, row in enumerate(rows):
             cell = row["cells"][gi]
             row_bg = CELL_BG if ridx % 2 == 0 else CELL_BG_ALT
+
+            # visible breaker whenever the calendar date changes (rows are
+            # already sorted newest-first, so same-day rows sit together)
+            cur_date = row["_ts"].date()
+            if prev_date is not None and cur_date != prev_date:
+                parts.append(
+                    f'<tr><td colspan="5" style="padding:0;'
+                    f'border:none;border-top:3px solid {SEP};'
+                    f'line-height:0;font-size:0;">&nbsp;</td></tr>'
+                )
+            prev_date = cur_date
+
             parts.append("<tr>")
             parts.append(
                 f'<td style="{TD_BASE}background:{SUBHEAD_BG};text-align:center;'
