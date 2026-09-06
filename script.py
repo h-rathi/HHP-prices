@@ -84,7 +84,7 @@ NOT_AVAILABLE = "not available"
 # Genuine outcomes (a redirect to another product, or a page that explicitly says
 # it's unavailable) are treated as FINAL and are NOT retried.
 MAX_ATTEMPTS = 3
-RETRY_BACKOFF_SEC = 5
+RETRY_BACKOFF_SEC = 22
 
 # Excel layout of Price Comparisons_v3_WIP (per product group of 9 columns):
 #   +0 Amazon price  +1 Samsung price  +2 BestBuy price
